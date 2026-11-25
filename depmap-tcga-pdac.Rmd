@@ -1,0 +1,1257 @@
+---
+title: "Dependências gênicas em PDAC: de linhagens (DepMap) a pacientes (TCGA-PAAD)"
+subtitle: "Pipeline v2 (sem scRNA-seq). Fases 1–3 e etapa 12: dados, alinhamento, treino em CV e avaliação"
+author: "M.A.M."
+date: "`r format(Sys.Date(), '%d/%m/%Y')`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    toc_depth: 3
+    code_folding: show
+params:
+  simulate: false          # TRUE = dados simulados, só para testar o código
+  run_download: false      # TRUE = baixa DepMap/TCGA (vários GB; ver seção 00)
+  use_cache: true
+  depmap_release: "DepMap Public 26Q3"   # TODO(confirmar no portal quando os arquivos chegarem)
+  depmap_dir: "data/depmap"
+  depmap_expr_file: "OmicsExpressionTPMLogp1HumanProteinCodingGenes.csv"  # 24Q4: OmicsExpressionProteinCodingGenesTPMLogp1.csv
+  depmap_crispr_file: "CRISPRGeneEffect.csv"
+  depmap_model_file: "Model.csv"
+  depmap_cn_file: "OmicsCNGene.csv"      # = OmicsCNGeneWGS.csv do 26Q3, renomeado (mesmo tamanho e data)
+  depmap_cn_scale: "linear"              # 26Q3 WGS: CN relativo linear; "log2p1" = log2(CN rel + 1) (24Q4)
+  tcga_dir: "data/tcga"
+  cnv_workflow: "ASCAT3"   # TODO(verificar no GDC): ASCAT2 / ASCAT3 / ABSOLUTE LiftOver
+  expr_thr: 1              # log2(TPM+1) mínimo para "expresso"
+  expr_frac: 0.10          # fração mínima de amostras acima do limiar (cada fonte)
+  mtap_cn_rel_thr: 0.3     # deleção de MTAP nas linhagens: CN relativo < 0.3
+  n_genes_align: 5000
+  n_cpc: 5
+  n_pc: 50
+  k_t2l: 50
+  k_l2t: 5
+  center_anchor: "pdac"    # "pdac" = centróide tumoral -> centróide das linhagens PDAC; "none" = Celligner puro
+  # --- Fase 3/4 (custo controlado por estes params; resultados em cache) ---
+  run_models: true         # FALSE = pula o treino (Fases 3-4 só com texto)
+  n_folds: 5
+  n_genes_y: 1000          # top-variância de Y (sem pan-essenciais), escolhido dentro do fold
+  inner_k: 5               # folds internos (agrupados) para o lambda do glmnet
+  en_alpha: 0.5
+  knn_k: 20
+  run_lpo: true            # esquema extra leave-pancreas-out (+2 ajustes)
+  run_eval: true           # etapa 12 (bootstrap, permutação, FDR)
+  n_perm: 50               # permutações de Y por fold (nulo agrupado entre genes); ~2,5 min cada
+  n_boot: 1000
+  r_thr: 0.3               # limiar de r pré-definido (antes de ver os resultados)
+  seed: 20261115
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE,
+                      fig.width = 7.5, fig.height = 4.5, dpi = 150, dev = "png",
+                      fig.path = "results/figs/")   # cada figura: results/figs/<chunk>-<n>.png
+dir.create("results/figs", recursive = TRUE, showWarnings = FALSE)
+dir.create("results/tabelas", recursive = TRUE, showWarnings = FALSE)
+# kable que também salva a tabela em results/tabelas/<chunk>.csv
+# (2ª tabela do mesmo chunk: <chunk>_2.csv, e assim por diante).
+.tab_n <- new.env()
+kable_csv <- function(x, ...) {
+  lab <- knitr::opts_current$get("label") %||% "sem_chunk"
+  n <- (if (exists(lab, envir = .tab_n, inherits = FALSE)) get(lab, envir = .tab_n) else 0) + 1
+  assign(lab, n, envir = .tab_n)
+  f <- file.path("results/tabelas", paste0(lab, if (n > 1) paste0("_", n), ".csv"))
+  df <- if (is.table(x) && length(dim(x)) == 2) as.data.frame.matrix(x) else as.data.frame(x)
+  utils::write.csv(df, f, row.names = !identical(rownames(df), as.character(seq_len(nrow(df)))),
+                   fileEncoding = "UTF-8")
+  knitr::kable(x, ...)
+}
+```
+
+# Sobre este documento {.unnumbered}
+
+Este Rmd implementa o pipeline v2 (`revisao/pipeline-v2-sem-scrna.html`): reunir e limpar os dados (etapas 00–03), colocar linhagens e tumores na mesma régua (04–05), treinar em validação cruzada agrupada com o alinhamento refeito dentro de cada fold (06, 07, 09, 10) e avaliar nas linhagens PDAC held-out (12). As etapas 08 e 11 (extensões) e 13–14 (pacientes) ainda são TODO. O custo da Fase 3 é controlado pelos params `run_models`, `n_folds`, `n_genes_y`, `n_perm`, e os resultados ficam em cache (`results/cache/`).
+
+Partes adaptadas de `tcga_march1.Rmd` (download TCGA-PAAD, limpeza da clínica, sobrevida, PCA, KM) estão marcadas com *"adaptado de tcga_march1.Rmd"*. O arquivo original não foi alterado.
+
+**Modos de execução** (parâmetros no cabeçalho YAML):
+
+- `simulate: true` gera dados **simulados** com a mesma estrutura dos reais. Serve só para validar o código. Nenhum número desse modo tem valor biológico.
+- `simulate: false` usa os arquivos em cache em `data/`. Se eles não existirem e `run_download: false`, o documento para após a seção 00 e diz o que falta.
+
+# 0. Configuração
+
+```{r instalar, eval=FALSE}
+# Rodar UMA vez, à mão (não roda no knit):
+install.packages(c("data.table", "dplyr", "tidyr", "ggplot2", "matrixStats",
+                   "glmnet", "FNN", "uwot", "survival", "survminer", "ggrepel"))
+install.packages("BiocManager")
+BiocManager::install(c("TCGAbiolinks", "SummarizedExperiment"))
+```
+
+```{r pacotes}
+pkgs <- c("data.table", "dplyr", "tidyr", "ggplot2", "matrixStats", "FNN", "uwot",
+          "survival", "survminer", "ggrepel", "TCGAbiolinks", "SummarizedExperiment")
+faltando <- pkgs[!vapply(pkgs, requireNamespace, logical(1), quietly = TRUE)]
+if (length(faltando)) stop("Pacotes faltando: ", paste(faltando, collapse = ", "),
+                           ". Ver o chunk 'instalar'.")
+suppressPackageStartupMessages({
+  library(dplyr); library(tidyr); library(ggplot2); library(survival)
+})
+source("R/tcc_helpers.R")
+source("R/tcc_simulate.R")
+set.seed(params$seed)
+theme_set(theme_minimal(base_size = 11))
+cores_fonte <- c(linha = "#4a3fa8", tumor = "#d1495b")
+for (d in c(params$depmap_dir, params$tcga_dir, "results/figs")) {
+  dir.create(d, recursive = TRUE, showWarnings = FALSE)
+}
+```
+
+```{r arquivos}
+depmap_paths <- file.path(params$depmap_dir, c(
+  expr = params$depmap_expr_file, crispr = params$depmap_crispr_file,
+  model = params$depmap_model_file, cn = params$depmap_cn_file))
+names(depmap_paths) <- c("expr", "crispr", "model", "cn")
+# Extras pequenos do release (opcionais; ainda não usados nas Fases 1–2, exceto
+# OmicsProfiles para diagnóstico de profiles por modelo).
+depmap_extra <- file.path(params$depmap_dir, c(
+  common_ess = "CRISPRInferredCommonEssentials.csv", profiles = "OmicsProfiles.csv",
+  confounders = "CRISPRConfounders.csv", hotspot = "OmicsSomaticMutationsMatrixHotspot.csv"))
+names(depmap_extra) <- c("common_ess", "profiles", "confounders", "hotspot")
+
+tcga_paths <- file.path(params$tcga_dir, c(
+  se = "TCGA_PAAD_STAR_SE.rds", clinical = "TCGA_PAAD_clinical_biotab.rds",
+  cnv = "TCGA_PAAD_CNV_gene.rds"))
+names(tcga_paths) <- c("se", "clinical", "cnv")
+# O tcga_march1.Rmd salvava o SE em bulkdata/; reaproveita se existir.
+legacy_se <- "bulkdata/TCGA_PAAD_SummarizedExperiment.rds"
+if (!file.exists(tcga_paths["se"]) && file.exists(legacy_se)) tcga_paths["se"] <- legacy_se
+
+have_real <- all(file.exists(depmap_paths[c("expr", "crispr", "model")])) &&
+  file.exists(tcga_paths["se"])
+MODE <- if (params$simulate) "sim" else if (have_real || params$run_download) "real" else "none"
+cache_dir <- file.path("results/cache", MODE)
+data.frame(arquivo = c(depmap_paths, tcga_paths, depmap_extra),
+           papel = c(rep("obrigatório", 3), "MTAP (recomendado)", "obrigatório",
+                     "clínica", "MTAP TCGA", rep("extra (opcional)", 4)),
+           existe = file.exists(c(depmap_paths, tcga_paths, depmap_extra)),
+           row.names = NULL)
+```
+
+**Modo desta execução: `r MODE`.** `r if (MODE == "sim") "<span style='color:#9b2c3a'><b>ATENÇÃO: DADOS SIMULADOS. Os números e figuras abaixo só testam o código.</b></span>"`
+
+# Fase 1: reunir e limpar
+
+## 00. Aquisição
+
+**Por quê:** o modelo aprende em linhagens (DepMap: expressão + efeito CRISPR Chronos) e é aplicado a tumores (TCGA-PAAD). Os dois lados precisam vir de um release fixo e ficar em cache local para que a análise seja reprodutível.
+
+### 00a. DepMap (CCLE)
+
+Arquivos do release `r params$depmap_release`: expressão (log2(TPM+1), protein-coding; no 26Q3 vem uma linha por *profile*, e ficamos só com o profile default de cada modelo, coluna `is_default_entry`), efeito gênico CRISPR (Chronos), metadados das linhagens (`Model.csv`) e número de cópias por gene (WGS, CN relativo em escala `r params$depmap_cn_scale`, para o status de MTAP). Os CSV somam alguns GB. Com `run_download: false` o chunk abaixo não roda; baixe à mão em <https://depmap.org/portal/data_page/> e salve em `data/depmap/`.
+
+```{r depmap-download, eval = params$run_download && MODE == "real"}
+depmap_download(params$depmap_release, basename(depmap_paths), params$depmap_dir)
+```
+
+### 00b. TCGA-PAAD (GDC)
+
+*Adaptado de tcga_march1.Rmd (l. 39–69).* Mudanças: o cache vai para `data/tcga/` e também baixamos o número de cópias por gene do GDC, que dá o rótulo de deleção de MTAP independente da expressão. A pureza ABSOLUTE, o subtipo e a histologia curada vêm da tabela do Raphael et al. 2017, que já vem embutida no TCGAbiolinks (`TCGAquery_subtype("paad")`), sem download.
+
+```{r tcga-download, eval = params$run_download && MODE == "real"}
+library(TCGAbiolinks)
+gdc_dir <- file.path(params$tcga_dir, "GDCdata")
+if (!file.exists(tcga_paths["se"])) {
+  query_paad <- GDCquery(project = "TCGA-PAAD",
+                         data.category = "Transcriptome Profiling",
+                         data.type = "Gene Expression Quantification",
+                         workflow.type = "STAR - Counts")
+  GDCdownload(query = query_paad, method = "api", files.per.chunk = 10, directory = gdc_dir)
+  saveRDS(GDCprepare(query = query_paad, directory = gdc_dir), tcga_paths["se"])
+}
+if (!file.exists(tcga_paths["clinical"])) {
+  query_clin <- GDCquery(project = "TCGA-PAAD", data.category = "Clinical",
+                         data.type = "Clinical Supplement", data.format = "BCR Biotab")
+  GDCdownload(query_clin, directory = gdc_dir)
+  clin_list <- GDCprepare(query_clin, directory = gdc_dir)
+  saveRDS(clin_list$clinical_patient_paad, tcga_paths["clinical"])
+}
+if (!file.exists(tcga_paths["cnv"])) {
+  # TODO(verificar): valores válidos de workflow.type mudam com o GDC.
+  # Se der erro, GDCquery lista as opções; ajuste params$cnv_workflow.
+  cnv <- tryCatch({
+    query_cnv <- GDCquery(project = "TCGA-PAAD", data.category = "Copy Number Variation",
+                          data.type = "Gene Level Copy Number",
+                          workflow.type = params$cnv_workflow)
+    GDCdownload(query_cnv, method = "api", files.per.chunk = 20, directory = gdc_dir)
+    GDCprepare(query_cnv, directory = gdc_dir)
+  }, error = function(e) { warning("CNV do GDC falhou: ", conditionMessage(e)); NULL })
+  if (!is.null(cnv)) saveRDS(cnv, tcga_paths["cnv"])
+}
+```
+
+```{r parar-sem-dados, echo=FALSE, results='asis'}
+if (MODE == "none") {
+  cat("\n\n> **Dados não encontrados.** Coloque os CSV do DepMap em `", params$depmap_dir,
+      "` e o SE do TCGA em `", tcga_paths["se"], "`, ou renderize com ",
+      "`params = list(run_download = TRUE)` (vários GB) ou `simulate = TRUE` (teste).\n", sep = "")
+  knitr::knit_exit()
+}
+```
+
+### 00c. Leitura dos dados brutos
+
+```{r ler-sim, eval = MODE == "sim"}
+sim <- simulate_tcc_data(seed = params$seed)
+dm_expr <- sim$dm_expr; dm_crispr <- sim$dm_crispr; dm_model <- sim$dm_model
+dm_cn <- sim$dm_cn; tc <- sim$tc; raph <- sim$raph; clin <- sim$clin
+tcga_cnv_mtap <- sim$tcga_cnv_mtap
+```
+
+```{r ler-depmap, eval = MODE == "real"}
+dm_expr   <- cached("dm_expr",   read_depmap_matrix(depmap_paths["expr"]),   params$use_cache, cache_dir)
+dm_crispr <- cached("dm_crispr", read_depmap_matrix(depmap_paths["crispr"]), params$use_cache, cache_dir)
+dm_model  <- as.data.frame(data.table::fread(depmap_paths["model"]))
+dm_cn <- if (file.exists(depmap_paths["cn"])) {
+  cached("dm_cn", {
+    cn_full <- read_depmap_matrix(depmap_paths["cn"])
+    cn_sub <- cn_full[, intersect(c("MTAP", "CDKN2A", "CDKN2B"), colnames(cn_full)), drop = FALSE]
+    for (a in c("n_rows_raw", "default_filter", "n_dup_symbols")) attr(cn_sub, a) <- attr(cn_full, a)
+    cn_sub
+  }, params$use_cache, cache_dir)
+} else NULL
+req <- c("ModelID", "PatientID", "OncotreeLineage", "OncotreeSubtype", "OncotreeCode")
+stopifnot("Model.csv sem colunas esperadas" = all(req %in% names(dm_model)))
+# Rastreabilidade da leitura: profiles brutos -> 1 por modelo
+leitura <- list(expressao = dm_expr, crispr = dm_crispr)
+if (!is.null(dm_cn)) leitura$cn <- dm_cn
+kable_csv(data.frame(
+  matriz = names(leitura),
+  linhas_brutas = vapply(leitura, \(m) as.integer(attr(m, "n_rows_raw") %||% NA), integer(1)),
+  filtro_default = vapply(leitura, \(m) attr(m, "default_filter") %||% NA_character_, character(1)),
+  modelos = vapply(leitura, nrow, integer(1)),
+  genes = vapply(leitura, ncol, integer(1)),
+  simbolos_dup_descartados = vapply(leitura, \(m) as.integer(attr(m, "n_dup_symbols") %||% NA), integer(1)),
+  row.names = NULL), caption = "Leitura dos CSV do DepMap")
+```
+
+```{r ler-tcga, eval = MODE == "real"}
+tc <- cached("tcga_prep", prep_tcga_expr(readRDS(tcga_paths["se"])), params$use_cache, cache_dir)
+raph <- as.data.frame(TCGAbiolinks::TCGAquery_subtype("paad"), check.names = FALSE)
+clin <- if (file.exists(tcga_paths["clinical"])) as.data.frame(readRDS(tcga_paths["clinical"])) else NULL
+tcga_cnv_mtap <- NULL
+if (file.exists(tcga_paths["cnv"])) {
+  cnv <- readRDS(tcga_paths["cnv"])
+  an <- SummarizedExperiment::assayNames(cnv)
+  a_use <- if ("min_copy_number" %in% an) "min_copy_number" else an[1]
+  rd <- as.data.frame(SummarizedExperiment::rowData(cnv))
+  row_mtap <- which(rd$gene_name == "MTAP")[1]
+  # Os colnames do CNV (ASCAT3) são pares tumor;normal em ordem variável,
+  # ex. "TCGA-IB-7888-01A;TCGA-IB-7888-10A". Pega o ID do tumor (código 01-09).
+  tumor_id <- vapply(strsplit(colnames(cnv), ";"), function(p) {
+    p16 <- substr(p, 1, 16)
+    tum <- p16[as.integer(substr(p16, 14, 15)) < 10]
+    if (length(tum)) tum[1] else NA_character_
+  }, character(1))
+  tcga_cnv_mtap <- data.frame(
+    sample = tumor_id,
+    min_copy_number = as.numeric(SummarizedExperiment::assay(cnv, a_use)[row_mtap, ]))
+  tcga_cnv_mtap <- tcga_cnv_mtap[!duplicated(tcga_cnv_mtap$sample), ]
+  rm(cnv)
+}
+```
+
+## 01. Harmonização de IDs
+
+**Por quê:** a expressão das linhagens e a dos tumores precisam falar dos mesmos genes. O DepMap usa colunas `SÍMBOLO (Entrez)` e o GDC usa Ensembl + `gene_name` (GENCODE v36). Usamos o símbolo HGNC como chave 1:1. Os símbolos duplicados são **descartados** no DepMap (são raros) e **somados** no GDC, no TPM, como em `tcga_march1.Rmd`. Essa decisão é declarada.
+
+*Nota de batch:* o TPM do DepMap vem do RSEM e o do GDC vem do STAR (augmented counts). São pipelines diferentes, e o alinhamento (etapa 05) precisa absorver essa fonte de batch.
+
+```{r ids}
+pc_gdc <- unique(tc$gene_types$symbol[tc$gene_types$gene_type == "protein_coding"])
+dm_only <- setdiff(colnames(dm_expr), colnames(tc$expr))
+types_dm_only <- tc$gene_types$gene_type[match(dm_only, tc$gene_types$symbol)]
+tab_ids <- data.frame(
+  item = c("Genes no arquivo de expressão DepMap (protein-coding)",
+           "Símbolos duplicados descartados no DepMap",
+           "Genes no GDC (todas as classes, Ensembl)",
+           "Símbolos protein-coding no GDC (após soma de duplicatas)",
+           "Duplicatas de símbolo somadas no GDC",
+           "Interseção DepMap x GDC (chave HGNC)",
+           "DepMap sem par protein-coding no GDC",
+           "  ...dos quais existem no GDC com outra classe",
+           "Genes com efeito CRISPR (Chronos)"),
+  n = c(ncol(dm_expr), max(0, attr(dm_expr, "n_dup_symbols") %||% 0),
+        tc$n_genes_total, ncol(tc$expr), tc$n_dup,
+        length(intersect(colnames(dm_expr), colnames(tc$expr))),
+        length(dm_only), sum(!is.na(types_dm_only)), ncol(dm_crispr)))
+kable_csv(tab_ids, caption = "Harmonização de genes")
+if (length(dm_only)) {
+  kable_csv(as.data.frame(table(classe_no_GDC = types_dm_only, useNA = "ifany")),
+               caption = "Genes do DepMap sem par protein-coding no GDC: classe no GDC (NA = símbolo ausente, possivelmente renomeado)")
+}
+```
+
+Os genes "ausentes" no GDC são, em geral, símbolos renomeados entre versões do HGNC/GENCODE. O mapeamento por Entrez/Ensembl recuperaria parte deles. TODO (opcional): mapear via `org.Hs.eg.db` se a perda for relevante.
+
+## 02. Curadoria das amostras
+
+**Por quê:** o alvo biológico é PDAC. Tumores neuroendócrinos, acinares e amostras mal classificadas mudam a expressão e a dependência. **Não há corte por pureza**: a pureza vira covariável e análise estratificada, porque cortar pureza em PDAC descartaria metade da coorte e selecionaria um subgrupo biológico.
+
+### 02a. Linhagens (DepMap)
+
+Usamos linhagens com expressão **e** CRISPR **e** metadados. O treino é pan-câncer, porque o modelo aprende relações gerais expressão→dependência. PDAC estrito = `OncotreeCode == "PAAD"` ou `OncotreeSubtype == "Pancreatic Adenocarcinoma"`.
+
+```{r curar-linhas}
+ids_ok <- Reduce(intersect, list(rownames(dm_expr), rownames(dm_crispr), dm_model$ModelID))
+lines_meta <- dm_model[match(ids_ok, dm_model$ModelID), ] |>
+  transmute(ModelID, PatientID = ifelse(is.na(PatientID) | PatientID == "", ModelID, PatientID),
+            CellLineName = pick_col(dm_model[match(ids_ok, dm_model$ModelID), ], "CellLineName"),
+            lineage = OncotreeLineage, subtype = OncotreeSubtype, code = OncotreeCode) |>
+  mutate(is_pancreas = lineage %in% "Pancreas",
+         is_pdac = code %in% "PAAD" | subtype %in% "Pancreatic Adenocarcinoma")
+rownames(lines_meta) <- lines_meta$ModelID
+
+flow_lines <- data.frame(
+  etapa = c("Linhagens com expressão", "Linhagens com CRISPR", "Linhagens em Model.csv",
+            "Expressão ∩ CRISPR ∩ Model", "  ...linhagem Pancreas", "  ...PDAC estrito"),
+  n = c(nrow(dm_expr), nrow(dm_crispr), nrow(dm_model), nrow(lines_meta),
+        sum(lines_meta$is_pancreas), sum(lines_meta$is_pdac)))
+kable_csv(flow_lines, caption = "Fluxo das linhagens")
+```
+
+Linhagens de pâncreas que **não** entram como PDAC estrito, para revisão manual (NET, ampular, acinar etc.):
+
+```{r linhas-pancreas-fora}
+lines_meta |> filter(is_pancreas, !is_pdac) |>
+  select(ModelID, CellLineName, subtype, code) |>
+  kable_csv(caption = "Linhagens Pancreas fora do PDAC estrito", row.names = FALSE)
+```
+
+```{r linhas-por-linhagem, fig.height=5}
+lines_meta |> count(lineage) |> mutate(lineage = reorder(lineage, n)) |>
+  ggplot(aes(n, lineage, fill = lineage == "Pancreas")) + geom_col() +
+  scale_fill_manual(values = c(`TRUE` = "#d1495b", `FALSE` = "grey60"), guide = "none") +
+  labs(x = "Linhagens com expressão + CRISPR", y = NULL,
+       title = "Linhagens celulares por tecido (Pancreas em destaque)")
+```
+
+```{r linhas-pacientes}
+dup_pt <- lines_meta |> count(PatientID) |> filter(n > 1)
+cat("Pacientes com mais de uma linhagem:", nrow(dup_pt),
+    "(", sum(dup_pt$n), "linhagens). Na Fase 3, os folds serão agrupados por PatientID.\n")
+```
+
+### 02b. Tumores (TCGA-PAAD)
+
+Lista de inclusão: as 150 amostras curadas do Raphael et al. 2017 (Cancer Cell 32:185, <doi:10.1016/j.ccell.2017.07.007>), que excluem NET e outros diagnósticos revistos. Do lado do GDC, mantemos só tumor primário e uma alíquota por amostra (a primeira em ordem de barcode). Sensibilidade: só "Ductal adenocarcinoma" segundo a revisão histológica do artigo (coluna RHH).
+
+```{r curar-tcga}
+cd <- tc$coldata
+cd$barcode <- if ("barcode" %in% names(cd)) cd$barcode else rownames(cd)
+cd$sample16 <- substr(cd$barcode, 1, 16)
+raph_ids <- raph[["Tumor Sample ID"]]
+
+n_alq <- nrow(cd); n_casos <- length(unique(substr(cd$barcode, 1, 12)))
+cd_t <- cd[cd$sample_type %in% "Primary Tumor", ]
+cd_t <- cd_t[order(cd_t$barcode), ]
+cd_u <- cd_t[!duplicated(cd_t$sample16), ]
+cd_r <- cd_u[cd_u$sample16 %in% raph_ids, ]
+hist_rhh <- raph[["Histological type by RHH"]][match(cd_r$sample16, raph_ids)]
+
+flow_tcga <- data.frame(
+  etapa = c("Alíquotas de RNA-seq no GDC (TCGA-PAAD)", "Casos (pacientes) distintos",
+            "Tumor primário", "Uma alíquota por amostra",
+            "Na lista curada Raphael 2017 (PRINCIPAL)",
+            "Sensibilidade: só ductal (RHH)"),
+  n = c(n_alq, n_casos, nrow(cd_t), nrow(cd_u), nrow(cd_r),
+        sum(hist_rhh %in% "Ductal adenocarcinoma")))
+kable_csv(flow_tcga, caption = "Fluxograma das amostras TCGA (n após cada filtro)")
+cat("Amostras do Raphael sem RNA-seq correspondente no GDC:",
+    length(setdiff(raph_ids, cd_u$sample16)), "\n")
+```
+
+```{r fluxograma-plot, fig.height=3.8}
+bind_rows(mutate(flow_tcga, fonte = "TCGA-PAAD"),
+          mutate(flow_lines[c(1, 4, 5, 6), ], fonte = "DepMap")) |>
+  mutate(etapa = factor(etapa, levels = rev(unique(etapa)))) |>
+  ggplot(aes(n, etapa)) + geom_col(fill = "#4a3fa8") +
+  geom_text(aes(label = n), hjust = -0.15, size = 3.2) +
+  facet_wrap(~fonte, scales = "free", ncol = 1) +
+  scale_x_continuous(expand = expansion(mult = c(0, .15))) +
+  labs(x = "n", y = NULL, title = "Fluxograma de amostras")
+```
+
+```{r montar-tcga}
+moffitt_col <- grep("^mRNA Moffitt clusters \\(All 150", names(raph), value = TRUE)[1]
+num <- function(x) suppressWarnings(as.numeric(as.character(x)))
+stage_raw <- as.character(pick_col(raph, "AJCC pathologic tumor stage"))
+tcga_meta <- data.frame(
+  sample = raph_ids, patient = substr(raph_ids, 1, 12),
+  purity = num(raph[["ABSOLUTE Purity"]]),
+  purity_class = pick_col(raph, "Purity Class (high or low)"),
+  moffitt = factor(raph[[moffitt_col]], levels = c("1", "2"), labels = c("basal", "classical")),
+  histology = raph[["Histological type by RHH"]],
+  stage = case_when(grepl("ia|ib|iia", stage_raw) & !grepl("iib", stage_raw) ~ "I–IIA",
+                    grepl("iib", stage_raw) ~ "IIB",
+                    grepl("iii|iv", stage_raw) ~ "III–IV",
+                    TRUE ~ NA_character_),
+  age = num(pick_col(raph, "Age at initial pathologic diagnosis")),
+  sex = pick_col(raph, "Gender"),
+  kras_mut = num(pick_col(raph, "KRAS Mutated (1 or 0)")),
+  cdkn2a_status = pick_col(raph, "CDKN2A Status"),
+  smgs = as.character(pick_col(raph, "Mutated SMGs")),
+  os_death = num(pick_col(raph, "Days to death")),
+  os_follow = num(pick_col(raph, "Follow up days")),
+  censored = num(pick_col(raph, "Censored 1=yes 0=no")))
+tcga_meta <- tcga_meta |>
+  mutate(os_time = ifelse(!is.na(os_death), os_death, os_follow),
+         os_event = 1 - censored,
+         smad4_mut = ifelse(is.na(smgs), NA, grepl("\\bSMAD4\\b", smgs)),
+         tp53_mut = ifelse(is.na(smgs), NA, grepl("\\bTP53\\b", smgs)),
+         stage = factor(stage, levels = c("I–IIA", "IIB", "III–IV")))
+tcga_meta <- tcga_meta[tcga_meta$sample %in% cd_r$sample16, ]
+rownames(tcga_meta) <- tcga_meta$sample
+```
+
+**Atualização da sobrevida pela clínica do GDC** (*adaptado de tcga_march1.Rmd, l. 95–143*): o suplemento BCR Biotab tem seguimento mais recente que a tabela de 2017. Onde ele tem tempo válido, substitui o da tabela do Raphael. Os nomes das colunas mudaram entre versões do Biotab (`days_to_death` → `death_days_to`), e o código aceita os dois.
+
+```{r sobrevida-gdc, eval = !is.null(clin)}
+clin_df <- clin
+if (!"bcr_patient_barcode" %in% names(clin_df)) names(clin_df) <- as.character(clin_df[1, ])
+clin_df <- clin_df[grepl("^TCGA-", clin_df$bcr_patient_barcode), ]
+clin_df[clin_df == "[Not Available]" | clin_df == "[Not Applicable]" |
+          clin_df == "[Discrepancy]" | clin_df == "[Unknown]"] <- NA
+d_death <- num(pick_col(clin_df, c("death_days_to", "days_to_death")))
+d_last  <- num(pick_col(clin_df, c("last_contact_days_to", "days_to_last_followup")))
+gdc_os <- data.frame(patient = clin_df$bcr_patient_barcode,
+                     time = ifelse(!is.na(d_death), d_death, d_last),
+                     event = ifelse(clin_df$vital_status == "Dead", 1,
+                                    ifelse(clin_df$vital_status == "Alive", 0, NA))) |>
+  filter(!is.na(time), time >= 0, !is.na(event))
+m <- match(tcga_meta$patient, gdc_os$patient)
+upd <- !is.na(m)
+mudou <- sum(upd & (tcga_meta$os_time != gdc_os$time[m] | tcga_meta$os_event != gdc_os$event[m]), na.rm = TRUE)
+tcga_meta$os_time[upd] <- gdc_os$time[m[upd]]
+tcga_meta$os_event[upd] <- gdc_os$event[m[upd]]
+cat("Pacientes com sobrevida do GDC:", sum(upd), "| tempo ou evento alterado:", mudou, "\n")
+```
+
+**Rótulo de MTAP no TCGA:** deleção homozigótica = `min_copy_number == 0` no número de cópias por gene do GDC. Se o CNV não estiver disponível, usamos como **proxy declarado** o status de CDKN2A do Raphael ("Deleted"). MTAP e CDKN2A são co-deletados com frequência em 9p21, mas não sempre.
+
+```{r mtap-tcga}
+if (!is.null(tcga_cnv_mtap)) {
+  tcga_meta$mtap_del <- tcga_cnv_mtap$min_copy_number[match(tcga_meta$sample, tcga_cnv_mtap$sample)] == 0
+  mtap_source <- "CNV GDC (min_copy_number == 0)"
+} else {
+  tcga_meta$mtap_del <- ifelse(is.na(tcga_meta$cdkn2a_status), FALSE,
+                               grepl("Deleted", tcga_meta$cdkn2a_status))
+  mtap_source <- "PROXY: CDKN2A Status do Raphael 2017"
+}
+cat("Fonte do rótulo MTAP:", mtap_source, "\n")
+kable_csv(table(MTAP_del = tcga_meta$mtap_del,
+                   CDKN2A_Raphael = addNA(factor(tcga_meta$cdkn2a_status)), useNA = "ifany"),
+             caption = "MTAP-del (rótulo usado) x status de CDKN2A (Raphael)")
+```
+
+```{r tcga-expr-final}
+# indexa pelo barcode escolhido (uma alíquota por amostra) e renomeia para 16 caracteres
+tcga_expr <- tc$expr[cd_r$barcode[match(tcga_meta$sample, cd_r$sample16)], , drop = FALSE]
+rownames(tcga_expr) <- tcga_meta$sample
+lines_expr <- dm_expr[lines_meta$ModelID, ]
+lines_crispr <- dm_crispr[lines_meta$ModelID, ]
+c(linhas = nrow(lines_expr), tumores = nrow(tcga_expr))
+```
+
+```{r liberar-memoria, include=FALSE}
+# As matrizes completas não são mais usadas daqui em diante (ficam em cache em disco).
+rm(dm_expr, dm_crispr); tc$expr <- NULL; invisible(gc())
+```
+
+### 02c. Pureza tumoral (covariável, não filtro)
+
+```{r pureza-na}
+data.frame(variavel = c("ABSOLUTE Purity", "Moffitt (150)", "Estádio", "Idade", "OS tempo"),
+           n_disponivel = c(sum(!is.na(tcga_meta$purity)), sum(!is.na(tcga_meta$moffitt)),
+                            sum(!is.na(tcga_meta$stage)), sum(!is.na(tcga_meta$age)),
+                            sum(!is.na(tcga_meta$os_time))),
+           n_NA = c(sum(is.na(tcga_meta$purity)), sum(is.na(tcga_meta$moffitt)),
+                    sum(is.na(tcga_meta$stage)), sum(is.na(tcga_meta$age)),
+                    sum(is.na(tcga_meta$os_time)))) |>
+  kable_csv(caption = "Completude das covariáveis nas amostras curadas")
+```
+
+As 150 do Raphael **não** passaram por corte de pureza: elas incluem tumores com ABSOLUTE de `r round(min(tcga_meta$purity, na.rm = TRUE), 2)` a `r round(max(tcga_meta$purity, na.rm = TRUE), 2)`. O artigo apenas rotula "alta/baixa pureza" (coluna *Purity Class*), e algumas análises do consórcio (Moffitt de 76 amostras, metilação, RPPA) usaram só as de alta pureza. Nós usamos as 150. TODO: conferir no texto do Raphael 2017 o critério exato do rótulo high/low antes de citar.
+
+```{r pureza-dist, fig.height=3.5}
+ggplot(tcga_meta, aes(purity)) +
+  geom_histogram(binwidth = 0.05, boundary = 0, fill = "#4a3fa8", colour = "white") +
+  geom_vline(xintercept = median(tcga_meta$purity, na.rm = TRUE), linetype = 2) +
+  labs(x = "Pureza ABSOLUTE", y = "Tumores",
+       title = "Distribuição da pureza tumoral (TCGA-PAAD curado)",
+       subtitle = sprintf("mediana = %.2f; tracejado = mediana",
+                          median(tcga_meta$purity, na.rm = TRUE)))
+```
+
+```{r pureza-assoc, fig.height=3.8}
+p_moff <- tryCatch(wilcox.test(purity ~ moffitt, data = tcga_meta)$p.value, error = function(e) NA)
+p_stage <- tryCatch(kruskal.test(purity ~ stage, data = tcga_meta)$p.value, error = function(e) NA)
+p_mtap <- tryCatch(wilcox.test(purity ~ mtap_del, data = tcga_meta)$p.value, error = function(e) NA)
+tcga_meta |>
+  select(purity, `Moffitt` = moffitt, `Estádio` = stage, `MTAP-del` = mtap_del) |>
+  mutate(across(-purity, as.character)) |>
+  pivot_longer(-purity, names_to = "variavel", values_to = "grupo") |>
+  filter(!is.na(grupo), !is.na(purity)) |>
+  ggplot(aes(grupo, purity)) + geom_boxplot(outlier.shape = NA, fill = "grey92") +
+  geom_jitter(width = 0.15, alpha = 0.5, size = 1) +
+  facet_wrap(~variavel, scales = "free_x") +
+  labs(x = NULL, y = "Pureza ABSOLUTE", title = "Pureza por subtipo, estádio e MTAP",
+       subtitle = sprintf("Wilcoxon Moffitt p = %.3g | Kruskal estádio p = %.3g | Wilcoxon MTAP p = %.3g",
+                          p_moff, p_stage, p_mtap))
+```
+
+A associação pureza × MTAP-del importa para a Fase 4. Se tumores MTAP-del tiverem pureza diferente, qualquer efeito de MTAP na dependência predita pode ser confundido pela pureza. Por isso a pureza entra como covariável.
+
+### 02d. Resumo clínico (TCGA-PAAD curado)
+
+```{r resumo-clinico}
+resumo_cat <- function(x, nome) {
+  t <- table(x, useNA = "ifany")
+  data.frame(variavel = nome, nivel = names(t), n = as.integer(t),
+             pct = sprintf("%.0f%%", 100 * as.integer(t) / length(x)))
+}
+bind_rows(
+  data.frame(variavel = "Idade (anos)", nivel = "mediana [IQR]",
+             n = NA, pct = sprintf("%.0f [%.0f–%.0f]", median(tcga_meta$age, na.rm = TRUE),
+                                   quantile(tcga_meta$age, .25, na.rm = TRUE),
+                                   quantile(tcga_meta$age, .75, na.rm = TRUE))),
+  resumo_cat(tcga_meta$sex, "Sexo"),
+  resumo_cat(tcga_meta$stage, "Estádio AJCC"),
+  resumo_cat(tcga_meta$moffitt, "Subtipo Moffitt"),
+  resumo_cat(tcga_meta$histology, "Histologia (RHH)"),
+  resumo_cat(tcga_meta$kras_mut, "KRAS mutado"),
+  resumo_cat(tcga_meta$mtap_del, "MTAP deletado"),
+  resumo_cat(tcga_meta$os_event, "Óbito (evento OS)")) |>
+  kable_csv(caption = "Características das amostras curadas")
+```
+
+```{r km-geral, fig.height=5}
+# Adaptado de tcga_march1.Rmd (survfit/ggsurvplot). Exploratório: estratos
+# pré-definidos (subtipo Moffitt), não quantis de expressão.
+km_df <- filter(tcga_meta, !is.na(os_time), !is.na(os_event), !is.na(moffitt))
+fit_km <- survfit(Surv(os_time / 30.44, os_event) ~ moffitt, data = km_df)
+survminer::ggsurvplot(fit_km, data = km_df, pval = TRUE, conf.int = TRUE, risk.table = TRUE,
+                      xlab = "Meses", ylab = "Sobrevida global",
+                      legend.title = "Moffitt", legend.labs = levels(droplevels(km_df$moffitt)),
+                      title = "Sobrevida global por subtipo Moffitt (exploratório)",
+                      ggtheme = theme_minimal())
+cat("Seguimento mediano (Kaplan–Meier reverso, meses):",
+    round(summary(survfit(Surv(os_time / 30.44, 1 - os_event) ~ 1, data = km_df))$table["median"], 1), "\n")
+```
+
+## 03. Filtro de genes
+
+**Por quê:** genes que não são expressos em uma das fontes só adicionam ruído e não podem ser transferidos de linhagem para tumor. Critério: protein-coding, presente nos dois lados (etapa 01), com log2(TPM+1) \> `r params$expr_thr` em ≥ `r 100 * params$expr_frac`% das linhagens **e** ≥ `r 100 * params$expr_frac`% dos tumores. **O filtro olha o TCGA, mas só X** (não supervisionado). Nenhum filtro usa Y. Isso é declarado no texto. Também saem de X os genes do chrY e o XIST: eles codificam o sexo do doador, cuja proporção difere entre linhagens e tumores, e não o estado tumoral. Os genes do locus 9p21 (± 1 Mb de MTAP) são marcados aqui, porque na Fase 3 o modelo A os remove de X (a expressão de MTAP vazaria o status de deleção).
+
+```{r filtro-genes}
+common <- intersect(colnames(lines_expr), colnames(tcga_expr))
+frac_l <- colMeans(lines_expr[, common] > params$expr_thr)
+frac_t <- colMeans(tcga_expr[, common] > params$expr_thr)
+keep_l <- frac_l >= params$expr_frac; keep_t <- frac_t >= params$expr_frac
+genes_expr <- common[keep_l & keep_t]
+# Genes de sexo: chrY e XIST codificam o sexo do doador, não o estado tumoral;
+# a proporção de sexo difere entre linhagens e tumores e o modelo poderia aprendê-la.
+sexo <- union(tc$gene_pos$symbol[tc$gene_pos$chr %in% c("chrY", "Y")], "XIST")
+genes_sexo <- intersect(genes_expr, sexo)
+genes_x <- setdiff(genes_expr, genes_sexo)
+locus_9p21 <- intersect(genes_near(tc$gene_pos, "MTAP", 1e6), genes_x)
+gx_tag <- sprintf("gx%d", length(genes_x))   # entra nas chaves de cache que dependem de genes_x
+kable_csv(data.frame(
+  etapa = c("Genes comuns (protein-coding, HGNC)", "Expressos nas linhagens",
+            "Expressos nos tumores", "Expressos nos dois",
+            "  ...removidos: chrY + XIST (sexo)", "genes_x (final)",
+            "  ...no locus 9p21 (± 1 Mb de MTAP; removidos no modelo A)"),
+  n = c(length(common), sum(keep_l), sum(keep_t), length(genes_expr), length(genes_sexo),
+        length(genes_x), length(locus_9p21))),
+  caption = "Filtro de genes")
+cat("Genes de sexo removidos:", paste(genes_sexo, collapse = ", "), "\n")
+cat("Genes 9p21:", paste(locus_9p21, collapse = ", "), "\n")
+```
+
+```{r filtro-genes-plot, fig.height=4.5}
+marcadores <- c("COL1A1", "ACTA2", "PTPRC", "PRSS1", "CPA1", "CELA3A", "KRT19", "MTAP", "PRMT5", "KRAS")
+data.frame(gene = common, frac_l, frac_t, mantido = common %in% genes_expr) |>
+  ggplot(aes(frac_l, frac_t, colour = mantido)) +
+  geom_point(alpha = 0.25, size = 0.6) +
+  ggrepel::geom_text_repel(data = ~ filter(.x, gene %in% marcadores), aes(label = gene),
+                           colour = "black", size = 3, max.overlaps = 20) +
+  geom_hline(yintercept = params$expr_frac, linetype = 2) +
+  geom_vline(xintercept = params$expr_frac, linetype = 2) +
+  scale_colour_manual(values = c(`TRUE` = "#4a3fa8", `FALSE` = "grey70")) +
+  labs(x = "Fração de linhagens expressando", y = "Fração de tumores expressando",
+       colour = "Mantido", title = "Filtro de expressão por fonte")
+```
+
+# Fase 2: mesma régua
+
+## 04. Transformação única
+
+**Por quê:** linhagens e tumores devem estar na mesma escala antes do alinhamento. Os dois lados ficam em log2(TPM+1), **sem z-score por coorte**: a centralização é parte do método de alinhamento (etapa 05), e o z-score por coorte apagaria diferenças reais de nível que o alinhamento precisa ver.
+
+```{r dist-expr, fig.height=4}
+set.seed(params$seed)
+amostra_l <- sample(rownames(lines_expr), min(40, nrow(lines_expr)))
+amostra_t <- sample(rownames(tcga_expr), min(40, nrow(tcga_expr)))
+dens_df <- bind_rows(
+  data.frame(fonte = "linha", amostra = rep(amostra_l, each = length(genes_x)),
+             valor = as.vector(t(lines_expr[amostra_l, genes_x]))),
+  data.frame(fonte = "tumor", amostra = rep(amostra_t, each = length(genes_x)),
+             valor = as.vector(t(tcga_expr[amostra_t, genes_x]))))
+ggplot(dens_df, aes(valor, group = amostra, colour = fonte)) +
+  geom_density(alpha = 0.3, linewidth = 0.3) +
+  scale_colour_manual(values = cores_fonte) +
+  labs(x = "log2(TPM + 1)", y = "Densidade",
+       title = "Distribuição da expressão por amostra (40 de cada fonte, genes_x)")
+```
+
+```{r media-genes, fig.height=4.5}
+mean_l <- colMeans(lines_expr[, genes_x]); mean_t <- colMeans(tcga_expr[, genes_x])
+mg <- data.frame(gene = genes_x, mean_l, mean_t, dif = mean_t - mean_l)
+ggplot(mg, aes(mean_l, mean_t)) + geom_point(alpha = 0.2, size = 0.6) +
+  geom_abline(linetype = 2) +
+  ggrepel::geom_text_repel(data = ~ slice_max(.x, abs(dif), n = 12), aes(label = gene),
+                           size = 3, colour = "#d1495b") +
+  labs(x = "Média nas linhagens (log2 TPM+1)", y = "Média nos tumores",
+       title = "Expressão média por gene: linhagens x tumores",
+       subtitle = sprintf("r = %.2f; rotulados = maiores diferenças (estroma/imune/ácino esperados)",
+                          cor(mean_l, mean_t)))
+```
+
+```{r top-dif}
+mg |> arrange(desc(dif)) |> head(15) |> mutate(across(where(is.numeric), \(x) round(x, 2))) |>
+  kable_csv(caption = "Genes mais altos nos tumores que nas linhagens (candidatos a componente não tumoral)",
+               row.names = FALSE)
+```
+
+## 05. Alinhamento inspirado no Celligner
+
+**Por quê:** mesmo na mesma escala, tumores e linhagens se separam pela fonte: os tumores trazem estroma, células imunes e ácino, e há o batch de protocolo (STAR × RSEM). Um modelo treinado nas linhagens e aplicado nos tumores veria essas diferenças como sinal. Seguimos a lógica do Celligner (Warren et al. 2021, Nat Commun 12:22):
+
+1.  `r params$n_genes_align` genes de maior variância (só X, em `genes_x`);
+2.  centralização por gene **dentro de cada fonte**;
+3.  **cPCA**: autovetores de Cov(tumores) − Cov(linhagens). São os eixos de variação que existem nos tumores e não nas linhagens. Os `r params$n_cpc` primeiros são removidos dos dois lados;
+4.  **MNN** (vizinhos mútuos; k tumor→linha = `r params$k_t2l`, linha→tumor = `r params$k_l2t`): os vetores de correção, suavizados por kernel gaussiano, levam os **tumores** para perto das linhagens.
+
+**Modificação declarada: alinhamento inspirado no Celligner, adaptado a uma coorte de uma só linhagem (centralização ancorada; nesta execução `center_anchor` = `r params$center_anchor`).** O Celligner centraliza um TCGA pan-câncer. Aqui o TCGA é só PAAD, e centralizar os tumores na própria média remove o componente de linhagem: os tumores caem no centróide pan-câncer das linhagens. Com `center_anchor = "pdac"`, soma-se aos tumores já centralizados o vetor *offset* = média das linhagens PDAC − média de todas as linhagens. O offset usa o rótulo de linhagem, mas só X (sem Y), e não vaza dependência. Os cPCs são calculados sem o offset. Por isso o texto do TCC deve dizer "inspirado no Celligner", não "Celligner".
+
+Ressalvas:
+
+- **Circularidade:** a fração de vizinhos PDAC sobe por construção com o offset, então ela não prova que o alinhamento funciona. O teste independente é o subtipo Moffitt (05c): tumores basais devem ter vizinhos-linhagem mais basais que os clássicos.
+- **Modelos lineares:** o offset é um vetor constante. No elastic net ele muda só o nível predito, não a ordenação entre pacientes de um gene. No k-NN ele muda a vizinhança.
+- **Fase 3:** no cenário A (PDAC no treino), o offset usa só as linhagens PDAC do treino de cada fold. No cenário B (leave-PDAC-out), o primário é "none" e a sensibilidade usa o offset com as linhagens PDAC do teste (transdutivo, só X; declarado).
+
+Esta é uma implementação simplificada, em R base + FNN, sem o pacote oficial. Nesta fase o ajuste usa **todas** as linhagens e é exploratório. Na Fase 3 ele será refeito dentro de cada fold (só linhagens de treino + TCGA; o TCGA entra no ajuste, mas sem Y). Parâmetros como os do Celligner (4 cPCs, k = 50/5); TODO(verificar): conferir os defaults no código do Celligner.
+
+```{r alinhar}
+anchor_idx <- if (params$center_anchor == "pdac") which(lines_meta$is_pdac) else NULL
+fit_al <- cached(sprintf("align_full_c%d_k%d_g%d_%s_%s", params$n_cpc, params$k_t2l,
+                         params$n_genes_align, params$center_anchor, gx_tag),
+  fit_alignment(lines_expr[, genes_x], tcga_expr[, genes_x],
+                n_genes = params$n_genes_align, n_cpc = params$n_cpc, n_pc = params$n_pc,
+                k_t2l = params$k_t2l, k_l2t = params$k_l2t, anchor_idx = anchor_idx,
+                return_matrices = TRUE),
+  params$use_cache, cache_dir)
+cat("Genes usados:", length(fit_al$genes), "| pares MNN:", fit_al$n_pairs,
+    "| tumores com par:", fit_al$n_tumors_paired, "de", nrow(tcga_expr), "\n")
+```
+
+### 05a. PCA antes e depois
+
+"Antes" é a PCA da expressão log2(TPM+1) bruta, com os mesmos genes, sem centralizar por fonte. "Só cPCA" é o estágio intermediário (centralizado por fonte e sem os cPCs). "Depois" é após o MNN.
+
+```{r pca-estagios}
+nl <- nrow(lines_expr)
+pca_raw <- pca_fit(rbind(lines_expr[, fit_al$genes], tcga_expr[, fit_al$genes]), params$n_pc)
+estagios <- list(
+  `1. bruto` = pca_raw$scores,
+  `2. centralizado + sem cPCs` = fit_al$scores_cpca_only,
+  `3. + MNN (alinhado)` = rbind(fit_al$feat_lines, fit_al$feat_tcga))
+meta_comb <- data.frame(
+  id = c(rownames(lines_expr), rownames(tcga_expr)),
+  fonte = rep(c("linha", "tumor"), c(nl, nrow(tcga_expr))),
+  tecido = c(ifelse(lines_meta$is_pdac, "Linhagem PDAC",
+                    ifelse(lines_meta$is_pancreas, "Linhagem pâncreas (não PDAC)", "Linhagem outro tecido")),
+             rep("Tumor PAAD", nrow(tcga_expr))),
+  pureza = c(rep(NA, nl), tcga_meta$purity))
+pca_df <- bind_rows(lapply(names(estagios), function(s) {
+  data.frame(meta_comb, PC1 = estagios[[s]][, 1], PC2 = estagios[[s]][, 2], estagio = s)
+}))
+cores_tecido <- c(`Linhagem outro tecido` = "grey75", `Linhagem pâncreas (não PDAC)` = "#f4a259",
+                  `Linhagem PDAC` = "#4a3fa8", `Tumor PAAD` = "#d1495b")
+```
+
+```{r pca-plot, fig.width=10, fig.height=4}
+ggplot(arrange(pca_df, tecido != "Linhagem outro tecido"), aes(PC1, PC2, colour = tecido)) +
+  geom_point(size = 0.9, alpha = 0.7) +
+  facet_wrap(~estagio, scales = "free") +
+  scale_colour_manual(values = cores_tecido) +
+  labs(colour = NULL, title = "PCA linhagens + tumores em cada estágio do alinhamento") +
+  theme(legend.position = "bottom")
+```
+
+```{r pca-pureza, fig.width=10, fig.height=3.8}
+ggplot(filter(pca_df, fonte == "tumor"), aes(PC1, PC2, colour = pureza)) +
+  geom_point(data = filter(pca_df, fonte == "linha"), colour = "grey88", size = 0.6) +
+  geom_point(size = 1.3) + facet_wrap(~estagio, scales = "free") +
+  scale_colour_viridis_c(option = "C") +
+  labs(title = "Tumores coloridos pela pureza ABSOLUTE (linhagens em cinza)")
+```
+
+### 05b. UMAP antes e depois
+
+```{r umap, fig.width=10, fig.height=4.3}
+umap_df <- cached(sprintf("umap_c%d_k%d_g%d_%s_%s", params$n_cpc, params$k_t2l,
+                          params$n_genes_align, params$center_anchor, gx_tag), {
+  set.seed(params$seed)
+  bind_rows(lapply(names(estagios)[c(1, 3)], function(s) {
+    u <- uwot::umap(estagios[[s]][, seq_len(min(30, ncol(estagios[[s]])))],
+                    n_neighbors = 15, min_dist = 0.3, n_threads = 1, n_sgd_threads = 1)
+    data.frame(meta_comb, U1 = u[, 1], U2 = u[, 2], estagio = s)
+  }))
+}, params$use_cache, cache_dir)
+ggplot(arrange(umap_df, tecido != "Linhagem outro tecido"), aes(U1, U2, colour = tecido)) +
+  geom_point(size = 0.8, alpha = 0.75) + facet_wrap(~estagio) +
+  scale_colour_manual(values = cores_tecido) +
+  labs(colour = NULL, title = "UMAP (30 PCs) antes e depois do alinhamento") +
+  theme(legend.position = "bottom")
+```
+
+### 05c. Métricas de mistura
+
+Para cada tumor, olhamos os 10 vizinhos mais próximos entre as linhagens: fração de **pâncreas** (`OncotreeLineage`) e de **PDAC estrito**, comparadas com a fração esperada ao acaso. Mistura por fonte: fração de **tumores** entre os 10 vizinhos de cada tumor no espaço combinado. Perto do acaso = fontes misturadas; perto de 1 = tumores isolados entre si. Um bom alinhamento mistura as fontes **e** coloca os tumores perto das linhagens de pâncreas.
+
+```{r metricas}
+met <- t(sapply(estagios, function(S) alignment_metrics(
+  S[seq_len(nl), , drop = FALSE], S[-seq_len(nl), , drop = FALSE],
+  lines_meta$is_pancreas, lines_meta$is_pdac, k = 10)))
+kable_csv(round(met, 3), caption = "Mistura e proximidade de tecido em cada estágio")
+```
+
+**Teste independente do offset: subtipo Moffitt.** Escore basal − clássico nas linhagens = média dos z-scores (entre linhagens) de marcadores basais menos a dos clássicos. Os marcadores são inspirados em Moffitt 2015 e Collisson 2019; TODO: conferir a lista final contra o artigo. Para cada tumor calculamos a média desse escore entre seus 10 vizinhos-linhagem. Se o alinhamento preserva a biologia tumoral, tumores basais devem ter vizinhos mais basais que os clássicos. Essa diferença não é criada pelo offset, que é o mesmo para todos os tumores.
+
+```{r moffitt-vizinhos}
+mof_basal <- c("KRT5", "KRT6A", "KRT17", "S100A2", "LY6D", "SPRR3", "SPRR1B", "CAV1", "LEMD1", "SLC2A1")
+mof_class <- c("GATA6", "TFF1", "TFF2", "CLDN18", "LGALS4", "CEACAM6", "VSIG2", "AGR2", "REG4", "CDH17")
+line_bc <- marker_score(lines_expr, mof_basal) - marker_score(lines_expr, mof_class)
+cat("Marcadores presentes: basais", length(intersect(mof_basal, colnames(lines_expr))),
+    "| clássicos", length(intersect(mof_class, colnames(lines_expr))), "\n")
+viz_bc <- function(S) {
+  nn <- FNN::get.knnx(S[seq_len(nl), , drop = FALSE], S[-seq_len(nl), , drop = FALSE], k = 10)$nn.index
+  rowMeans(matrix(line_bc[nn], nrow = nrow(nn)))
+}
+mof_tab <- bind_rows(lapply(names(estagios), function(s) {
+  v <- viz_bc(estagios[[s]])
+  ok <- !is.na(tcga_meta$moffitt)
+  w <- tryCatch(wilcox.test(v[ok] ~ tcga_meta$moffitt[ok]), error = function(e) NULL)
+  data.frame(estagio = s,
+             viz_basal_em_tumor_basal = mean(v[tcga_meta$moffitt %in% "basal"]),
+             viz_basal_em_tumor_classico = mean(v[tcga_meta$moffitt %in% "classical"]),
+             p_wilcoxon = if (is.null(w)) NA else w$p.value)
+}))
+kable_csv(mof_tab, digits = 3, row.names = FALSE,
+             caption = "Escore basal−clássico médio dos 10 vizinhos-linhagem, por subtipo Moffitt do tumor")
+```
+
+**Incerteza do offset.** O offset é estimado com `r sum(lines_meta$is_pdac)` linhagens PDAC. O bootstrap das linhagens PDAC (200×) mede o quanto o vetor muda: a norma e a similaridade de cosseno com o offset completo.
+
+```{r offset-bootstrap, eval = params$center_anchor == "pdac"}
+G <- fit_al$genes
+idx_p <- which(lines_meta$is_pdac)
+mu_all <- colMeans(lines_expr[, G])
+off_full <- colMeans(lines_expr[idx_p, G, drop = FALSE]) - mu_all
+set.seed(params$seed)
+boot_off <- t(replicate(200, {
+  o <- colMeans(lines_expr[sample(idx_p, replace = TRUE), G, drop = FALSE]) - mu_all
+  c(norma = sqrt(sum(o^2)), cosseno = sum(o * off_full) / sqrt(sum(o^2) * sum(off_full^2)))
+}))
+data.frame(n_linhas_PDAC = length(idx_p), norma_offset = sqrt(sum(off_full^2)),
+           norma_IC95 = paste(round(quantile(boot_off[, "norma"], c(.025, .975)), 2), collapse = "–"),
+           cosseno_mediano = median(boot_off[, "cosseno"]),
+           cosseno_IC95 = paste(round(quantile(boot_off[, "cosseno"], c(.025, .975)), 3), collapse = "–")) |>
+  kable_csv(digits = 3, caption = "Estabilidade do vetor de offset (bootstrap das linhagens PDAC)")
+```
+
+```{r dist-nn, fig.height=3.5}
+data.frame(antes = fit_al$dist_nn_before, depois = fit_al$dist_nn_after) |>
+  pivot_longer(everything(), names_to = "estagio", values_to = "d") |>
+  mutate(estagio = factor(estagio, c("antes", "depois"),
+                          c("centralizado + sem cPCs", "+ MNN"))) |>
+  ggplot(aes(d, fill = estagio)) + geom_density(alpha = 0.5) +
+  labs(x = "Distância de cada tumor à linhagem mais próxima (espaço de PCs)",
+       y = "Densidade", fill = NULL, title = "Efeito do MNN na distância tumor→linhagem")
+```
+
+### 05d. O que os cPCs removem?
+
+**Por quê:** os cPCs deveriam capturar o componente não tumoral (estroma, imune, ácino). Mas o contraste usa só tumores PAAD contra linhagens pan-câncer: a variância **entre tecidos** das linhagens é subtraída, e o contraste pode ficar enviesado. Diagnóstico: correlacionar os scores dos tumores em cada cPC com a pureza ABSOLUTE, com escores simples de marcadores e com o subtipo Moffitt. Os escores são a média dos z-scores de marcadores clássicos. **Não são ESTIMATE**; são um proxy declarado. TODO (opcional): usar ESTIMATE/assinaturas de estroma do Moffitt 2015.
+
+```{r cpc-diagnostico}
+marc <- list(estroma = c("COL1A1", "COL1A2", "COL3A1", "FAP", "PDGFRB", "ACTA2", "DCN", "LUM", "POSTN"),
+             imune = c("PTPRC", "CD3E", "CD2", "LCP2", "CD53", "CD48", "CD247", "CD52"),
+             acinar = c("PRSS1", "CPA1", "CELA3A", "CTRB1", "PNLIP", "CPB1", "CEL"))
+scores_t <- sapply(marc, function(g) marker_score(tcga_expr, g))
+cov_t <- data.frame(pureza = tcga_meta$purity, scores_t,
+                    moffitt_basal = as.numeric(tcga_meta$moffitt == "basal"))
+cpc_cor <- function(S) {
+  sapply(cov_t, function(v) apply(S, 2, function(s) suppressWarnings(
+    cor(s, v, use = "pairwise.complete.obs", method = "spearman"))))
+}
+cc_all <- cpc_cor(fit_al$cpc_scores_tcga)
+rownames(cc_all) <- paste0("cPC", seq_len(nrow(cc_all)))
+kable_csv(round(cc_all, 2), caption = "Spearman: scores dos tumores nos cPCs (contraste vs todas as linhagens) x pureza/marcadores")
+```
+
+Variante de diagnóstico: contraste da cPCA só contra as **linhagens PDAC**.
+
+```{r cpc-variante-pdac}
+fit_pdac <- cached(sprintf("align_contrast_pdac_c%d_g%d_%s", params$n_cpc, params$n_genes_align, gx_tag),
+  fit_alignment(lines_expr[, genes_x], tcga_expr[, genes_x],
+                n_genes = params$n_genes_align, n_cpc = params$n_cpc, n_pc = params$n_pc,
+                k_t2l = params$k_t2l, k_l2t = params$k_l2t,
+                contrast_idx = which(lines_meta$is_pdac), return_matrices = TRUE),
+  params$use_cache, cache_dir)
+cc_pdac <- cpc_cor(fit_pdac$cpc_scores_tcga)
+rownames(cc_pdac) <- paste0("cPC", seq_len(nrow(cc_pdac)))
+kable_csv(round(cc_pdac, 2), caption = "Spearman: cPCs com contraste vs linhagens PDAC")
+```
+
+```{r cpc-heatmap, fig.height=3.5, fig.width=8}
+bind_rows(data.frame(as.table(cc_all), contraste = "vs todas as linhagens"),
+          data.frame(as.table(cc_pdac), contraste = "vs linhagens PDAC")) |>
+  ggplot(aes(Var2, Var1, fill = Freq)) + geom_tile() +
+  geom_text(aes(label = sprintf("%.2f", Freq)), size = 3) +
+  facet_wrap(~contraste) +
+  scale_fill_gradient2(low = "#2b6cb0", high = "#c53030", limits = c(-1, 1)) +
+  labs(x = NULL, y = NULL, fill = "rho", title = "O que cada cPC captura nos tumores")
+```
+
+```{r cpc-texto, echo=FALSE, results='asis'}
+mx <- max(abs(cc_all[, c("pureza", "estroma", "imune", "acinar")]), na.rm = TRUE)
+cat(sprintf("\n**Leitura automática:** a maior |rho| entre os cPCs (contraste pan-câncer) e pureza/estroma/imune/ácino é %.2f. %s\n",
+            mx, if (mx < 0.3) "Os cPCs **não** se correlacionam bem com pureza/estroma. Eles podem estar capturando outra diferença (batch STAR×RSEM ou tecido), o que deve ser dito no texto." else
+              "Pelo menos um cPC captura o componente não tumoral, como esperado."))
+```
+
+### 05e. Sensibilidade: número de cPCs e k do MNN
+
+```{r sensibilidade}
+grid <- rbind(expand.grid(n_cpc = c(2, 4, 6), k_t2l = c(20, 50), ancora = c("none", "pdac"),
+                          stringsAsFactors = FALSE),
+              data.frame(n_cpc = 0, k_t2l = c(20, 50), ancora = "pdac"))   # sem remoção de cPCs
+sens <- cached(sprintf("align_sensitivity_g%d_%s", params$n_genes_align, gx_tag), {
+  bind_rows(lapply(seq_len(nrow(grid)), function(i) {
+    f <- fit_alignment(lines_expr[, genes_x], tcga_expr[, genes_x],
+                       n_genes = params$n_genes_align, n_cpc = grid$n_cpc[i], n_pc = params$n_pc,
+                       k_t2l = grid$k_t2l[i], k_l2t = params$k_l2t,
+                       anchor_idx = if (grid$ancora[i] == "pdac") which(lines_meta$is_pdac) else NULL)
+    m <- alignment_metrics(f$feat_lines, f$feat_tcga, lines_meta$is_pancreas, lines_meta$is_pdac)
+    data.frame(grid[i, ], n_pairs = f$n_pairs, t(m))
+  }))
+}, params$use_cache, cache_dir)
+kable_csv(sens, digits = 3, caption = "Métricas do alinhamento por hiperparâmetro")
+```
+
+**Critério de decisão (antes de olhar a Fase 3):** o alinhamento "funciona" se (i) a mistura por fonte cair em relação ao bruto, (ii) o teste Moffitt (05c) mostrar vizinhos mais basais para tumores basais, e (iii) os cPCs removidos se correlacionarem com pureza/estroma (05d). A fração de vizinhos PDAC só é informativa na versão "none", porque com a âncora ela sobe por construção. Os números da execução simulada não entram no TCC; só os dos dados reais. Se isso não ocorrer para nenhuma configuração razoável, isso entra no TCC como limitação, e a Fase 3 usa o fallback (PCs exclusivos do TCGA removidos + MNN), sem seguir como se o alinhamento tivesse funcionado.
+
+## Exploração do alvo Y (dependências CRISPR)
+
+**Por quê:** antes de modelar, é preciso saber como as dependências se distribuem, quais genes têm variação suficiente para serem alvo e se a âncora biológica (MTAP-del → PRMT5/MAT2A) aparece nas linhagens. MTAP entra como **controle**: espera-se dependência ≈ 0 (o gene não é essencial). A seleção final de Y será feita **dentro do fold** (Fase 3). Aqui ela é só descritiva.
+
+```{r y-global, fig.height=3.8}
+mean_dep <- colMeans(lines_crispr, na.rm = TRUE)
+sd_dep <- matrixStats::colSds(lines_crispr, na.rm = TRUE)
+frac_ess <- colMeans(lines_crispr < -0.5, na.rm = TRUE)
+ydf <- data.frame(gene = colnames(lines_crispr), mean_dep, sd_dep, frac_ess,
+                  classe = ifelse(frac_ess >= 0.9, "pan-essencial (≥90% < −0.5)",
+                                  ifelse(sd_dep >= quantile(sd_dep, 0.9, na.rm = TRUE),
+                                         "variável (top 10% DP)", "outros")))
+ancoras <- c("PRMT5", "KRAS", "MAT2A", "MTAP")
+ggplot(ydf, aes(mean_dep, sd_dep, colour = classe)) + geom_point(alpha = 0.3, size = 0.6) +
+  ggrepel::geom_label_repel(data = ~ filter(.x, gene %in% ancoras), aes(label = gene),
+                            colour = "black", size = 3) +
+  scale_colour_manual(values = c("pan-essencial (≥90% < −0.5)" = "#d1495b",
+                                 "variável (top 10% DP)" = "#4a3fa8", outros = "grey70")) +
+  labs(x = "Efeito médio (Chronos)", y = "DP entre linhagens", colour = NULL,
+       title = "Dependências: média x variabilidade (todas as linhagens)")
+kable_csv(count(ydf, classe), caption = "Classes descritivas de genes (todas as linhagens; a seleção real será dentro do fold)")
+```
+
+```{r y-ancoras, fig.height=4}
+anc_df <- data.frame(lines_meta[, c("ModelID", "is_pdac")],
+                     lines_crispr[, intersect(ancoras, colnames(lines_crispr)), drop = FALSE],
+                     check.names = FALSE) |>
+  pivot_longer(-c(ModelID, is_pdac), names_to = "gene", values_to = "efeito") |>
+  mutate(grupo = ifelse(is_pdac, "PDAC", "outras"))
+ggplot(anc_df, aes(efeito, fill = grupo)) + geom_density(alpha = 0.5, na.rm = TRUE) +
+  geom_vline(xintercept = 0, colour = "grey40") +
+  geom_vline(xintercept = -1, linetype = 2, colour = "grey40") +
+  facet_wrap(~gene, scales = "free_y", nrow = 1) +
+  scale_fill_manual(values = c(PDAC = "#d1495b", outras = "grey60")) +
+  labs(x = "Efeito Chronos (−1 ≈ mediana dos essenciais)", y = "Densidade", fill = NULL,
+       title = "Genes-âncora: PDAC x demais linhagens")
+```
+
+**Status de MTAP nas linhagens:** deleção = CN relativo \< `r params$mtap_cn_rel_thr` no número de cópias por gene do DepMap (escala do arquivo: `r params$depmap_cn_scale`; no 26Q3 o CN WGS já vem linear relativo, no 24Q4 vinha em log2(CN relativo + 1)). O limiar é declarado antes da análise e aplicado na escala do arquivo. Ele é cruzado com a expressão de MTAP e com a deleção de CDKN2A.
+
+```{r mtap-linhas}
+stopifnot(params$depmap_cn_scale %in% c("linear", "log2p1"))
+thr <- if (params$depmap_cn_scale == "linear") params$mtap_cn_rel_thr else log2(params$mtap_cn_rel_thr + 1)
+if (!is.null(dm_cn) && "MTAP" %in% colnames(dm_cn)) {
+  cn_m <- dm_cn[match(lines_meta$ModelID, rownames(dm_cn)), , drop = FALSE]
+  lines_meta$mtap_cn <- cn_m[, "MTAP"]
+  lines_meta$mtap_del <- lines_meta$mtap_cn < thr
+  lines_meta$cdkn2a_del <- if ("CDKN2A" %in% colnames(cn_m)) cn_m[, "CDKN2A"] < thr else NA
+  mtap_line_source <- "CN DepMap"
+} else {
+  lines_meta$mtap_cn <- NA
+  lines_meta$mtap_del <- lines_expr[, "MTAP"] < 1   # PROXY declarado
+  lines_meta$cdkn2a_del <- NA
+  mtap_line_source <- "PROXY: expressão de MTAP < 1"
+}
+lines_meta$mtap_expr <- if ("MTAP" %in% colnames(lines_expr)) lines_expr[, "MTAP"] else NA
+cat("Fonte do status MTAP nas linhagens:", mtap_line_source, "\n")
+kable_csv(table(MTAP_del = lines_meta$mtap_del, CDKN2A_del = lines_meta$cdkn2a_del,
+                   useNA = "ifany"), caption = "MTAP-del x CDKN2A-del (todas as linhagens)")
+kable_csv(table(PDAC = lines_meta$is_pdac, MTAP_del = lines_meta$mtap_del, useNA = "ifany"),
+             caption = "MTAP-del por grupo")
+```
+
+```{r mtap-cn-expr, fig.height=3.8, eval = !all(is.na(lines_meta$mtap_cn))}
+ggplot(lines_meta, aes(mtap_cn, mtap_expr, colour = mtap_del)) +
+  geom_point(alpha = 0.6, size = 1) + geom_vline(xintercept = thr, linetype = 2) +
+  scale_colour_manual(values = c(`TRUE` = "#d1495b", `FALSE` = "grey60")) +
+  labs(x = if (params$depmap_cn_scale == "linear") "MTAP: CN relativo" else "MTAP: log2(CN relativo + 1)",
+       y = "MTAP: log2(TPM + 1)", colour = "MTAP-del",
+       title = "Checagem do limiar de deleção: CN x expressão de MTAP")
+```
+
+```{r prmt5-mtap, fig.height=4}
+pd <- anc_df |> left_join(lines_meta[, c("ModelID", "mtap_del")], by = "ModelID") |>
+  filter(!is.na(mtap_del), gene %in% c("PRMT5", "MAT2A", "MTAP"))
+bind_rows(mutate(pd, escopo = "Todas as linhagens"),
+          mutate(filter(pd, is_pdac), escopo = "Só PDAC")) |>
+  ggplot(aes(mtap_del, efeito, fill = mtap_del)) +
+  geom_boxplot(outlier.shape = NA, na.rm = TRUE) +
+  geom_jitter(width = 0.15, size = 0.6, alpha = 0.4, na.rm = TRUE) +
+  facet_grid(escopo ~ gene) +
+  scale_fill_manual(values = c(`TRUE` = "#d1495b", `FALSE` = "grey80"), guide = "none") +
+  labs(x = "MTAP deletado", y = "Efeito Chronos",
+       title = "Âncora MTAP→PRMT5/MAT2A nas linhagens (MTAP = controle)")
+```
+
+```{r prmt5-mtap-teste}
+teste_anc <- function(d, g) {
+  x <- d[[g]][d$mtap_del %in% TRUE]; y <- d[[g]][d$mtap_del %in% FALSE]
+  if (sum(!is.na(x)) < 3 || sum(!is.na(y)) < 3) return(NULL)
+  w <- wilcox.test(x, y)
+  data.frame(gene = g, n_del = sum(!is.na(x)), n_wt = sum(!is.na(y)),
+             mediana_del = median(x, na.rm = TRUE), mediana_wt = median(y, na.rm = TRUE),
+             p_wilcoxon = w$p.value)
+}
+d_all <- data.frame(lines_meta, lines_crispr[, intersect(c("PRMT5", "MAT2A", "MTAP"), colnames(lines_crispr)), drop = FALSE])
+tab_anc <- bind_rows(
+  mutate(bind_rows(lapply(c("PRMT5", "MAT2A", "MTAP"), \(g) teste_anc(d_all, g))), escopo = "todas"),
+  mutate(bind_rows(lapply(c("PRMT5", "MAT2A", "MTAP"), \(g) teste_anc(filter(d_all, is_pdac), g))), escopo = "só PDAC"))
+kable_csv(tab_anc, digits = 4, caption = "MTAP-del vs efeito CRISPR. Em 'todas', a diferença pode refletir composição de tecido")
+# Sensibilidade ao limiar/escala do CN: quantas linhagens mudam de rótulo
+if (!all(is.na(lines_meta$mtap_cn))) {
+  cat("MTAP-del com limiar na escala linear (", params$mtap_cn_rel_thr, "):",
+      sum(lines_meta$mtap_cn < params$mtap_cn_rel_thr, na.rm = TRUE),
+      "| na escala log2p1 (", round(log2(params$mtap_cn_rel_thr + 1), 3), "):",
+      sum(lines_meta$mtap_cn < log2(params$mtap_cn_rel_thr + 1), na.rm = TRUE), "\n")
+}
+```
+
+```{r salvar-fases12}
+dir.create(cache_dir, recursive = TRUE, showWarnings = FALSE)
+saveRDS(list(lines_meta = lines_meta, tcga_meta = tcga_meta, genes_x = genes_x,
+             locus_9p21 = locus_9p21, flow_tcga = flow_tcga, flow_lines = flow_lines,
+             tab_anc = tab_anc, mtap_line_source = mtap_line_source,
+             params = params, mode = MODE),
+        file.path(cache_dir, "fases12_objetos.rds"))
+```
+
+# Fase 3: treinar dentro de folds
+
+**Regra geral:** tudo que é ajustado (seleção de Y, alinhamento, padronização de X, lambda do glmnet) é ajustado **só nas linhagens de treino de cada fold**. As linhagens de teste são apenas projetadas. Os tumores do TCGA entram no ajuste do alinhamento de todo fold (só X, sem Y), como no Celligner. As funções estão em `R/tcc_helpers.R` (`select_targets`, `fold_features`, `run_fold_models`, `mgaussian_fit_predict`, `knn_predict`).
+
+```{r f3-setup, eval = params$run_models}
+pan_genes <- if (file.exists(depmap_extra["common_ess"])) read_common_essentials(depmap_extra["common_ess"]) else NULL
+cfg <- list(n_genes_align = params$n_genes_align, n_cpc = params$n_cpc, n_pc = params$n_pc,
+            k_t2l = params$k_t2l, k_l2t = params$k_l2t, n_genes_y = params$n_genes_y,
+            anchors = c("PRMT5", "MAT2A", "KRAS"), knn_k = params$knn_k,
+            inner_k = params$inner_k, en_alpha = params$en_alpha, seed = params$seed)
+Xl_cv <- lines_expr[, genes_x]; Xt_cv <- tcga_expr[, genes_x]
+Y_all <- lines_crispr
+f3_tag <- sprintf("K%d_y%d_%s_a%.2f_k%d_pc%d_c%d_s%d", params$n_folds, params$n_genes_y, gx_tag,
+                  params$en_alpha, params$knn_k, params$n_pc, params$n_cpc, params$seed)
+```
+
+## 06. Alvo Y dentro do fold de treino
+
+**Por quê:** Y são os efeitos Chronos que queremos prever. Genes pan-essenciais (essenciais em quase toda linhagem) têm pouca variação entre linhagens e inflariam o desempenho sem dizer nada sobre seletividade. Usamos a lista do próprio DepMap (`CRISPRInferredCommonEssentials.csv`). Entre os demais genes, ficam os `r params$n_genes_y` de maior variância **nas linhagens de treino de cada fold** (genes com \> 5% de NA no treino ficam fora), mais as âncoras pré-definidas (PRMT5, MAT2A, KRAS). Os NA restantes do treino são imputados pela média do gene no treino, porque o glmnet multi-resposta exige Y completo. A avaliação ignora os NA do teste.
+
+*Ressalva declarada:* a lista de pan-essenciais do DepMap foi inferida com todas as linhagens do release, inclusive as que caem no teste de cada fold. Ela é um filtro de genes, não de linhagens, e o vazamento é de segunda ordem. A variância, que é o critério que ordena os genes, é calculada só no treino.
+
+```{r y-pan, eval = params$run_models}
+kable_csv(data.frame(
+  item = c("Genes com efeito CRISPR", "Pan-essenciais (DepMap, presentes em Y)",
+           "Candidatos a Y (não pan-essenciais)", "Y por fold (top-variância + âncoras)"),
+  n = c(ncol(Y_all), length(intersect(pan_genes, colnames(Y_all))),
+        ncol(Y_all) - length(intersect(pan_genes, colnames(Y_all))), params$n_genes_y)),
+  caption = "Construção de Y")
+```
+
+## 07. Features
+
+**Por quê:** X = os `r params$n_pc` componentes do alinhamento (etapa 05) **refeito dentro de cada fold** com as linhagens de treino + TCGA. Assim a PCA, os cPCs, o MNN e a âncora PDAC nunca veem as linhagens de teste.
+
+- **Modelo A (principal):** só os componentes alinhados, construídos **sem** os `r length(locus_9p21)` genes do locus 9p21 e sem número de cópias. Sem eles, o modelo não consegue "ler" a deleção de MTAP diretamente, e o teste MTAP→PRMT5 nos pacientes (etapa 14) não fica circular.
+- **Modelo B (comparação/ablação):** os mesmos componentes + duas indicadoras de deleção (MTAP e CDKN2A, CN relativo \< `r params$mtap_cn_rel_thr`). Só no elastic net.
+- Pureza **não** entra como feature: nas linhagens ela vale 1 por construção.
+
+```{r features-b, eval = params$run_models}
+extra_B <- cbind(mtap_del = as.numeric(lines_meta$mtap_del %in% TRUE),
+                 cdkn2a_del = as.numeric(lines_meta$cdkn2a_del %in% TRUE))
+rownames(extra_B) <- lines_meta$ModelID
+cat("Genes de X para o alinhamento por fold:", length(setdiff(genes_x, locus_9p21)),
+    "(genes_x sem 9p21) | linhagens sem CN (indicadoras = 0, declarado):",
+    sum(is.na(lines_meta$mtap_del)), "\n")
+```
+
+## 08. Pseudo-bulk guiado por scRNA (EXTENSÃO)
+
+TODO (fora do núcleo): só se houver scRNA de PDAC e tempo, com ganho medido contra a v2.
+
+## 09. Validação cruzada agrupada por linhagem
+
+**Por quê:** linhagens do mesmo paciente são quase réplicas. Se uma cair no treino e outra no teste, o desempenho fica otimista. Os `r params$n_folds` folds são **agrupados por PatientID** e **estratificados por PDAC**, para que cada fold tenha linhagens PDAC no teste. O lambda do glmnet é escolhido por CV interna, também agrupada, dentro do treino.
+
+Esquema extra, **leave-pancreas-out (LPO)**: todas as linhagens de pâncreas no teste e o resto no treino. É o cenário mais duro, porque o modelo nunca viu pâncreas. Offset da âncora (parecer do Atlas): no CV, a âncora usa só as PDAC do treino de cada fold. No LPO, o primário é `"none"` (sem âncora) e a sensibilidade usa o centróide das PDAC do **teste** (transdutivo, só X, declarado).
+
+```{r folds, eval = params$run_models}
+folds <- make_group_folds(lines_meta$PatientID, K = params$n_folds,
+                          strata = lines_meta$is_pdac, seed = params$seed)
+stopifnot("PatientID em mais de um fold" =
+            all(tapply(folds, lines_meta$PatientID, \(f) length(unique(f))) == 1))
+kable_csv(as.data.frame.matrix(table(fold = folds, PDAC = lines_meta$is_pdac)),
+             caption = "Linhagens por fold (colunas: PDAC estrito)")
+```
+
+```{r cv-rodar, eval = params$run_models}
+cv_res <- cached(paste0("cv_", f3_tag), lapply(seq_len(params$n_folds), function(k) {
+  tr <- which(folds != k); te <- which(folds == k)
+  ff <- fold_features(Xl_cv, Xt_cv, tr, te, lines_meta$is_pdac, cfg,
+                      exclude_genes = locus_9p21, anchor = "pdac")
+  res <- run_fold_models(ff, Y_all, cfg, lines_meta$PatientID, pan_genes, extra = extra_B)
+  res$ff <- ff; res$fold <- k
+  res
+}), params$use_cache, cache_dir)
+kable_csv(data.frame(
+  fold = seq_along(cv_res),
+  n_treino = vapply(cv_res, \(r) length(r$ff$tr), integer(1)),
+  n_teste = vapply(cv_res, \(r) length(r$te), integer(1)),
+  pares_MNN = vapply(cv_res, \(r) as.integer(r$ff$n_pairs), integer(1)),
+  lambda_A = vapply(cv_res, \(r) r$info$en_A$lambda, numeric(1)),
+  features_A = vapply(cv_res, \(r) as.integer(r$info$en_A$nzero), integer(1)),
+  features_B = vapply(cv_res, \(r) as.integer(r$info$en_B$nzero), integer(1))),
+  digits = 3, caption = "Resumo dos folds (features com coeficiente ≠ 0 no mgaussian)")
+```
+
+Estabilidade de Y: em quantos folds cada gene foi escolhido. A avaliação principal usa o **núcleo** de genes escolhidos em todos os folds, porque só eles têm predição held-out para todas as linhagens.
+
+```{r y-estabilidade, eval = params$run_models}
+sel <- table(unlist(lapply(cv_res, `[[`, "targets")))
+genes_core <- names(sel)[sel == length(cv_res)]
+kable_csv(as.data.frame(table(folds_em_que_foi_escolhido = sel)),
+             caption = sprintf("Genes de Y por número de folds (núcleo = %d genes)", length(genes_core)))
+```
+
+```{r lpo-rodar, eval = params$run_models && params$run_lpo}
+lpo_res <- cached(paste0("lpo_", f3_tag), {
+  tr <- which(!lines_meta$is_pancreas); te <- which(lines_meta$is_pancreas)
+  lapply(c(none = "none", pdac_test = "pdac_test"), function(a) {
+    ff <- fold_features(Xl_cv, Xt_cv, tr, te, lines_meta$is_pdac, cfg,
+                        exclude_genes = locus_9p21, anchor = a)
+    res <- run_fold_models(ff, Y_all, cfg, lines_meta$PatientID, pan_genes, extra = extra_B)
+    res$ff <- ff
+    res
+  })
+}, params$use_cache, cache_dir)
+cat("LPO: treino =", length(lpo_res$none$ff$tr), "linhagens não pâncreas | teste =",
+    length(lpo_res$none$te), "linhagens de pâncreas (", sum(lines_meta$is_pdac), "PDAC)\n")
+```
+
+## 10. Baselines e modelos
+
+**Por quê:** um modelo só interessa se vencer referências simples. Comparamos:
+
+1.  **trivial**: média de cada gene no treino (mesma predição para toda linhagem; r indefinido dentro de um fold);
+2.  **k-NN** (k = `r params$knn_k`): média de Y dos vizinhos de treino no espaço alinhado;
+3.  **elastic net multi-resposta** (`glmnet`, `family = "mgaussian"`, α = `r params$en_alpha`), modelos A e B. Um único ajuste prevê todos os genes de Y. A penalidade é de grupo por feature: cada componente entra ou sai para todos os genes ao mesmo tempo. Ajustar um elastic net por gene seria \~1000× mais lento.
+
+```{r cv-preds, eval = params$run_models}
+modelos <- c("trivial", "knn", "en_A", "en_B")
+P_cv <- setNames(lapply(modelos, \(m) assemble_preds(cv_res, m, lines_meta$ModelID)[, genes_core]), modelos)
+idx_pdac <- which(lines_meta$is_pdac)
+r_por_gene <- function(P, idx) colwise_cor_na(P[idx, , drop = FALSE], Y_all[rownames(P)[idx], colnames(P), drop = FALSE])
+mse_por_gene <- function(P, idx) colMeans((P[idx, , drop = FALSE] - Y_all[rownames(P)[idx], colnames(P), drop = FALSE])^2, na.rm = TRUE)
+resumo_cv <- bind_rows(lapply(modelos, function(m) {
+  bind_rows(lapply(list(`todas held-out` = seq_len(nrow(lines_meta)), `PDAC held-out` = idx_pdac), function(idx) {
+    r <- r_por_gene(P_cv[[m]], idx)
+    skill <- 1 - mse_por_gene(P_cv[[m]], idx) / mse_por_gene(P_cv$trivial, idx)
+    data.frame(r_mediano = median(r, na.rm = TRUE), frac_r_acima_thr = mean(r >= params$r_thr, na.rm = TRUE),
+               ganho_MSE_vs_trivial_mediano = median(skill, na.rm = TRUE))
+  }), .id = "linhagens") |> mutate(modelo = m, .before = 1)
+}))
+resumo_cv[resumo_cv$modelo == "trivial", c("r_mediano", "frac_r_acima_thr")] <- NA   # r do trivial não tem sentido
+kable_csv(resumo_cv, digits = 3,
+             caption = sprintf("CV agrupada (%d folds), %d genes do núcleo. Ganho MSE = 1 − MSE/MSE_trivial",
+                               params$n_folds, length(genes_core)))
+```
+
+```{r cv-plot, eval = params$run_models, fig.height=4}
+bind_rows(lapply(modelos[-1], \(m) data.frame(modelo = m, r = r_por_gene(P_cv[[m]], idx_pdac)))) |>
+  ggplot(aes(r, colour = modelo)) + geom_density(na.rm = TRUE) +
+  geom_vline(xintercept = c(0, params$r_thr), linetype = c(1, 2), colour = "grey40") +
+  scale_colour_manual(values = c(knn = "#f4a259", en_A = "#4a3fa8", en_B = "#d1495b")) +
+  labs(x = "r de Pearson por gene (predito × observado, PDAC held-out)", y = "Densidade",
+       colour = NULL, title = "Desempenho por gene nas linhagens PDAC held-out",
+       subtitle = sprintf("%d genes; n = %d linhagens PDAC; tracejado = limiar pré-definido r = %.1f",
+                          length(genes_core), length(idx_pdac), params$r_thr))
+```
+
+```{r prmt5-pred, eval = params$run_models, fig.height=3.8}
+bind_rows(lapply(c("en_A", "en_B"), function(m) data.frame(
+  modelo = m, predito = P_cv[[m]][, "PRMT5"], observado = Y_all[lines_meta$ModelID, "PRMT5"],
+  mtap_del = lines_meta$mtap_del, pdac = lines_meta$is_pdac))) |>
+  filter(pdac, !is.na(mtap_del)) |>
+  ggplot(aes(predito, observado, colour = mtap_del)) + geom_point(size = 1.6, alpha = 0.8) +
+  geom_smooth(aes(group = 1), method = "lm", se = FALSE, colour = "grey30", linewidth = 0.5) +
+  facet_wrap(~modelo) +
+  scale_colour_manual(values = c(`TRUE` = "#d1495b", `FALSE` = "grey55")) +
+  labs(x = "PRMT5 predito (held-out)", y = "PRMT5 observado (Chronos)", colour = "MTAP-del",
+       title = "PRMT5 nas linhagens PDAC held-out: modelo A (sem MTAP) × B (com MTAP)")
+```
+
+```{r lpo-resumo, eval = params$run_models && params$run_lpo}
+idx_lpo_pdac <- match(lines_meta$ModelID[lines_meta$is_pdac], rownames(lpo_res$none$en_A))
+bind_rows(lapply(names(lpo_res), function(a) {
+  bind_rows(lapply(c("knn", "en_A", "en_B"), function(m) {
+    P <- lpo_res[[a]][[m]]
+    r <- r_por_gene(P, idx_lpo_pdac)
+    data.frame(ancora = a, modelo = m, n_genes = length(r), r_mediano = median(r, na.rm = TRUE),
+               frac_r_acima_thr = mean(r >= params$r_thr, na.rm = TRUE),
+               r_PRMT5 = if ("PRMT5" %in% names(r)) r[["PRMT5"]] else NA)
+  }))
+})) |> kable_csv(digits = 3, caption = "Leave-pancreas-out: desempenho nas linhagens PDAC (todas no teste). 'none' = primário; 'pdac_test' = sensibilidade transdutiva")
+```
+
+O que comparar: se o desempenho no LPO cair muito em relação ao CV, o modelo depende de ter visto pâncreas no treino. A diferença entre `none` e `pdac_test` mede o quanto a âncora muda o resultado. Nos modelos lineares ela muda pouco a ordenação, porque o offset é constante. No k-NN ela muda a vizinhança.
+
+## 11. MLP multi-tarefa (EXTENSÃO)
+
+TODO (fora do núcleo): só se k-NN/elastic net já funcionarem e houver tempo. Mesmo esquema de folds e as mesmas features por fold (`cv_res[[k]]$ff`), comparado com o en_A.
+
+# Fase 4: perguntar sobre os pacientes
+
+## 12. Avaliação com incerteza
+
+**Por quê:** um r mediano sozinho não diz quais genes são previsíveis. Para cada gene do núcleo, nas `r sum(lines_meta$is_pdac)` linhagens PDAC held-out: r de Pearson e Spearman, IC 95% por bootstrap de linhagens (`r params$n_boot` reamostragens), p empírico contra um **nulo por permutação** e FDR de Benjamini–Hochberg entre genes. No nulo, as linhas de Y são embaralhadas no treino de cada fold (`r params$n_perm` vezes), o mgaussian é reajustado e as predições held-out são avaliadas igual às reais; os r nulos de todos os genes formam uma referência única. X e alinhamento não mudam, porque não usam Y. **Limiar pré-definido:** gene "previsível" = r ≥ `r params$r_thr`, FDR \< 0.10 e limite inferior do IC \> 0. A distribuição inteira também é reportada.
+
+```{r eval-genes, eval = params$run_models && params$run_eval}
+ev <- cached(paste0("eval_", f3_tag, "_b", params$n_boot), lapply(c(en_A = "en_A", en_B = "en_B", knn = "knn"), function(m)
+  eval_genes(P_cv[[m]], Y_all, idx_pdac, genes_core, n_boot = params$n_boot, seed = params$seed)),
+  params$use_cache, cache_dir)
+```
+
+```{r nulo-perm, eval = params$run_models && params$run_eval}
+# Uma entrada de cache por permutação: se o knit for interrompido, retoma de onde parou,
+# e aumentar n_perm reaproveita as permutações já feitas.
+r_null <- unlist(lapply(seq_len(params$n_perm), function(p) {
+  cached(sprintf("null_%s_perm%03d", f3_tag, p), {
+    fr <- lapply(cv_res, function(r) run_fold_models(
+      r$ff, Y_all, cfg, lines_meta$PatientID, models = "en_A", targets = r$targets,
+      perm_seed = params$seed + 1000 * p + r$fold))
+    P0 <- assemble_preds(fr, "en_A", lines_meta$ModelID)[, genes_core]
+    r_por_gene(P0, idx_pdac)
+  }, params$use_cache, file.path(cache_dir, "nulo"))
+}))
+cat("Nulo agrupado: ", sum(is.finite(r_null)), "valores de r | mediana =",
+    round(median(r_null, na.rm = TRUE), 3), "| quantil 95% =", round(quantile(r_null, .95, na.rm = TRUE), 3), "\n")
+# Classe descritiva (não usada na seleção): seletivo forte = efeito < −1 em ≥ 5% das linhagens
+frac_forte <- colMeans(Y_all[, genes_core] < -1, na.rm = TRUE)
+ev <- lapply(ev, function(d) {
+  d$p_perm <- perm_pvalue(d$r_pearson, r_null)
+  d$fdr <- p.adjust(d$p_perm, "BH")
+  d$classe <- ifelse(frac_forte[d$gene] >= 0.05, "seletivo forte", "seletivo fraco")
+  d$previsivel <- d$r_pearson >= params$r_thr & d$fdr < 0.10 & d$ci_low > 0
+  d
+})
+bind_rows(lapply(ev, function(d) d |> group_by(classe) |>
+  summarise(n_genes = n(), r_mediano = median(r_pearson, na.rm = TRUE),
+            rho_mediano = median(r_spearman, na.rm = TRUE),
+            n_FDR_0.10 = sum(fdr < 0.10, na.rm = TRUE), n_previsiveis = sum(previsivel, na.rm = TRUE),
+            .groups = "drop")), .id = "modelo") |>
+  kable_csv(digits = 3, caption = "Etapa 12: genes previsíveis nas linhagens PDAC held-out, por classe (nulo do en_A usado para todos)")
+```
+
+O nulo foi construído com o en_A e é usado como referência também para o en_B e o k-NN. Isso é uma aproximação: o nulo exato de cada modelo exigiria permutações próprias.
+
+```{r eval-plot, eval = params$run_models && params$run_eval, fig.height=3.8}
+bind_rows(data.frame(fonte = "observado (en_A)", r = ev$en_A$r_pearson),
+          data.frame(fonte = "nulo (Y permutado)", r = r_null)) |>
+  ggplot(aes(r, fill = fonte)) + geom_density(alpha = 0.5, na.rm = TRUE) +
+  geom_vline(xintercept = params$r_thr, linetype = 2) +
+  scale_fill_manual(values = c(`observado (en_A)` = "#4a3fa8", `nulo (Y permutado)` = "grey65")) +
+  labs(x = "r por gene (PDAC held-out)", y = "Densidade", fill = NULL,
+       title = "r observado × nulo por permutação (modelo A)")
+```
+
+```{r eval-ancoras, eval = params$run_models && params$run_eval}
+bind_rows(lapply(ev, \(d) filter(d, gene %in% cfg$anchors)), .id = "modelo") |>
+  select(modelo, gene, n, r_pearson, r_spearman, ci_low, ci_high, p_perm, fdr) |>
+  kable_csv(digits = 3, caption = "Genes-âncora: desempenho held-out nas linhagens PDAC")
+ev$en_A |> filter(previsivel) |> arrange(desc(r_pearson)) |> head(20) |>
+  select(gene, classe, r_pearson, ci_low, ci_high, fdr) |>
+  kable_csv(digits = 3, caption = "Top 20 genes previsíveis (modelo A)")
+```
+
+```{r salvar-fase3, eval = params$run_models}
+saveRDS(list(folds = folds, genes_core = genes_core, resumo_cv = resumo_cv,
+             ev = if (exists("ev")) ev else NULL, cfg = cfg, tag = f3_tag),
+        file.path(cache_dir, "fase3_resumo.rds"))
+```
+
+## 13. Inferência no TCGA
+
+TODO: `Y_hat_tcga` com o modelo final (alinhamento e Y ajustados em todas as linhagens).
+
+## 14. Validação
+
+TODO (a): MTAP-del vs PRMT5 predito, modelos A e B, ajustado por pureza, IC e permutação (`mtap_test`); estratificado por tercil de pureza. TODO (b): controles (Y embaralhado, só-pureza, pares gene-marcador falsos via `mtap_effect_all_genes`, ablação de CNV); correlação de cada Y_hat com pureza/estroma e regressão residual. TODO (c): Cox multivariado (idade, estádio, pureza, Moffitt) para 3–5 genes pré-definidos, C-index com IC bootstrap; KM só ilustrativo.
+
+# Extensões (stubs)
+
+- TODO: pseudo-bulk guiado por scRNA (etapa 08).
+- TODO: MLP multi-tarefa (etapa 11).
+- TODO: organoides de PDAC (RNA-seq + resposta a fármacos públicos; Tiriac 2018).
+- TODO: âncoras extras (EMT→CDS2, SMARCA4/SMARCA2, ARID1A/ARID1B).
+- TODO: predição conforme / ensemble para intervalos por paciente.
+
+# Reprodutibilidade
+
+```{r session}
+str(params)
+sessionInfo()
+```

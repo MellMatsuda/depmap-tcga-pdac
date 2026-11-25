@@ -1,0 +1,4 @@
+"","viz_pancreas","acaso_pancreas","viz_pdac","acaso_pdac","viz_mesma_fonte_tumor","acaso_fonte"
+"1. bruto",0.431,0.053,0.431,0.052,1,0.104
+"2. centralizado + sem cPCs",0.773,0.053,0.773,0.052,0.995,0.104
+"3. + MNN (alinhado)",0.625,0.053,0.623,0.052,0.986,0.104

@@ -1,0 +1,10 @@
+"item","n"
+"Genes no arquivo de expressão DepMap (protein-coding)",19218
+"Símbolos duplicados descartados no DepMap",0
+"Genes no GDC (todas as classes, Ensembl)",60660
+"Símbolos protein-coding no GDC (após soma de duplicatas)",19938
+"Duplicatas de símbolo somadas no GDC",24
+"Interseção DepMap x GDC (chave HGNC)",18722
+"DepMap sem par protein-coding no GDC",496
+"  ...dos quais existem no GDC com outra classe",57
+"Genes com efeito CRISPR (Chronos)",18434

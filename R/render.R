@@ -1,0 +1,7 @@
+Sys.setenv(RSTUDIO_PANDOC = "C:/Program Files/RStudio/resources/app/bin/quarto/bin/tools")
+setwd("C:/Users/athos/tcc mell")
+args <- commandArgs(trailingOnly = TRUE)
+p <- if (length(args)) eval(parse(text = args[1])) else list()
+t0 <- Sys.time()
+rmarkdown::render("TCCMELL.Rmd", params = p, envir = new.env(), quiet = TRUE)
+cat("Render OK em", format(Sys.time() - t0), "\n")

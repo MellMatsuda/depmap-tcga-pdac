@@ -1,0 +1,8 @@
+"etapa","n"
+"Genes comuns (protein-coding, HGNC)",18722
+"Expressos nas linhagens",14282
+"Expressos nos tumores",14923
+"Expressos nos dois",13568
+"  ...removidos: chrY + XIST (sexo)",9
+"genes_x (final)",13559
+"  ...no locus 9p21 (± 1 Mb de MTAP; removidos no modelo A)",8

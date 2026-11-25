@@ -1,0 +1,7 @@
+"medida","valor"
+"Genes previsíveis",245
+"DP mediano: observado PDAC",0.297048728333463
+"DP mediano: predito PDAC",0.074264603158646
+"DP mediano: predito tumores",0.0346920478101905
+"Fração mediana de tumores fora da faixa predita em PDAC",0
+"Correlação entre genes: mediana predita tumor × observada PDAC",0.943352129703424

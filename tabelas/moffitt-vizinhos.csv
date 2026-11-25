@@ -1,0 +1,4 @@
+"estagio","viz_basal_em_tumor_basal","viz_basal_em_tumor_classico","p_wilcoxon"
+"1. bruto",0.0720869330363,-0.720971853337791,2.26417107285215e-09
+"2. centralizado + sem cPCs",-0.351712539397516,-1.29296830787027,2.22044604925031e-16
+"3. + MNN (alinhado)",-0.193164959913974,-1.29496559629932,4.44089209850063e-16

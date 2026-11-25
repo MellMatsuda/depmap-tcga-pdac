@@ -1,0 +1,9 @@
+"controle","valor"
+"PRMT5: efeito padronizado de MTAP-del (modelo A)",-0.609187102837483
+"PRMT5: fração de genes com efeito igual ou mais negativo",0.00997008973080758
+"PRMT5: efeito bruto observado",-0.02422910536874
+"Y embaralhado: p (efeito tão negativo quanto o observado)",0.0196078431372549
+"Pureza: |rho| mediano entre genes previsíveis",0.309102043637055
+"Pureza: fração de genes previsíveis com |rho| > 0.3",0.522448979591837
+"PRMT5 × pureza (rho)",-0.426581215089584
+"KRAS × pureza (rho)",-0.532070234948039
